@@ -1,0 +1,320 @@
+---
+title: "TB world wide"
+author: "Sanghyun In"
+date: "2025-02-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load Required Libraries
+library(dplyr)
+library(tidyverse)
+library(openxlsx)
+library(purrr)
+library(here)
+library(writexl)
+library(sf)
+library(ggplot2)
+library(cowplot)
+library(plotly)
+library(knitr)
+library(rnaturalearth)         # For world polygons
+library(rnaturalearthdata)
+library(ggthemes)
+library(shiny)
+library(leaflet)
+library(DT)
+library(shinydashboard)
+library(rsconnect)
+
+```
+
+```{r data load and processing}
+# Load TB incidence data
+tb_file <- here("TB/API_SH.TBS.INCD_DS2_en_csv_v2_76088.csv")
+tb_data <- read_csv(tb_file, skip = 4)
+
+# Load country metadata (Region, Income Group)
+meta_file <- here("TB/Metadata_Country_API_SH.TBS.INCD_DS2_en_csv_v2_76088.csv")
+all_profile_data <- read_csv(meta_file)
+
+
+# --- PROCESS METADATA ---
+
+# Extract country metadata and rename the country code column
+country_data <- all_profile_data %>%
+  filter(!is.na(Region)) %>%
+  dplyr::select(`Country Code`, Region, IncomeGroup) %>%
+  rename(country_code = `Country Code`)
+
+# --- PROCESS TB DATA ---
+
+# Pivot TB data from wide to long format (keep years 2000+)
+tb_data <- tb_data %>%
+  rename(
+    country_name = `Country Name`,
+    country_code = `Country Code`,
+    indicator_name = `Indicator Name`,
+    indicator_code = `Indicator Code`
+  ) %>%
+  dplyr::select(-...69) %>%  # Drop unwanted column
+  pivot_longer(
+    cols = 5:68,             # Columns for years
+    names_to = "year",
+    values_to = "tb_incidence_per"
+  ) %>%
+  mutate(across(c(year, tb_incidence_per), as.integer)) %>%
+  filter(year >= 2000)
+
+# Merge TB data with country metadata
+tb_country_data <- tb_data %>%
+  left_join(country_data, by = "country_code") %>%
+  filter(!is.na(tb_incidence_per))
+
+# --- SUBSET FOR REGIONAL AND INCOME ANALYSIS ---
+# (These subsets are used later for creating aggregated maps)
+
+# For regional-level analysis, filter by a list of region codes (as per WHO profile)
+tb_region_data <- tb_country_data %>%
+  filter(country_code %in% c("EAS", "ECS", "LCN", "MEA", "SSF", "SAS", "NAC", "WLD"))
+
+# For income-level analysis, filter by a list of income-related country codes
+tb_income_data <- tb_country_data %>%
+  filter(country_code %in% c("HIC", "LIC", "UMC", "LMC", "WLD"))
+
+# --- LOAD WORLD MAP DATA ---
+# Use rnaturalearth (small scale for lighter map)
+world <- ne_countries(scale = "small", returnclass = "sf")
+
+# (Ensure the world map has a column with country names matching your TB data)
+world <- world %>%
+  mutate(country_name = name)  # Create a column named country_name
+
+# --- MERGE WORLD MAP WITH TB DATA ---
+# Join TB data with the world map by matching country codes.
+# Here we assume your TB data's "country_code" corresponds to ISO A3 codes in world (if not, adjust accordingly).
+tb_world_data <- world %>%
+  dplyr::select(iso_a3, name, continent, region_un, region_wb, income_grp, geometry) %>%
+  left_join(tb_data, by = c("iso_a3" = "country_code")) %>%
+  filter(!is.na(tb_incidence_per))
+
+# --- AGGREGATE GEOMETRIES FOR AGGREGATED MAPS ---
+# (Note: Aggregation for region/income maps is optional and only used if you wish to display group-level data.)
+
+# Ensure geometries are valid
+tb_world_data <- tb_world_data %>%
+  mutate(geometry = st_make_valid(geometry))
+
+# Aggregate Countries into Regional Shapefiles using st_combine (faster but does not dissolve boundaries)
+region_shapes <- tb_world_data %>%
+  group_by(region_wb, year) %>%
+  summarise(geometry = st_combine(geometry), .groups = "drop")
+
+# Aggregate geometries by Income Group
+income_shapes <- tb_world_data %>%
+  group_by(income_grp, year) %>%
+  summarise(geometry = st_combine(geometry), .groups = "drop")
+
+# Merge TB Incidence Data with Income-Level Shapes (if needed)
+tb_income_map <- income_shapes %>%
+  left_join(tb_income_data, by = c("income_grp" = "country_name", "year" = "year"))
+
+```
+
+
+```{r plot, echo=FALSE}
+ggplot(tb_region_data, aes(x = year, y = tb_incidence_per, color = `country_name`)) +
+  geom_line(size = 0.5) +  # Standard lines for static plot
+  geom_point(size = 2) +   # Standard points
+  scale_y_continuous(labels = scales::comma) +  # Format y-axis with commas
+  labs(
+    x = "Year",
+    y = "Incidence of tuberculosis (per 100,000 people)"
+  ) +
+  theme_minimal() +  # Minimal theme for cleaner visuals
+  theme(
+    text = element_text(size = 10))
+
+#
+ggplot(tb_income_data, aes(x = year, y = tb_incidence_per, color = `country_name`)) +
+  geom_line(size = 0.5) +  # Standard lines for static plot
+  geom_point(size = 2) +   # Standard points
+  scale_y_continuous(labels = scales::comma) +  # Format y-axis with commas
+  labs(
+    x = "Year",
+    y = "Incidence of tuberculosis (per 100,000 people)"
+  ) +
+  theme_minimal() +  # Minimal theme for cleaner visuals
+  theme(
+    text = element_text(size = 10))
+
+
+plot_tb_map <- function(year_selected) {
+  ggplot(tb_world_data %>% filter(year == year_selected)) +
+    geom_sf(aes(fill = tb_incidence_per), color = "gray50", size = 0.1) +
+    scale_fill_viridis_c(option = "magma", na.value = "gray90", name = "TB Incidence (per 100k)") +
+    labs(title = paste("Global Tuberculosis Incidence (", year_selected, ")", sep = ""),
+         subtitle = "Incidence per 100,000 people",
+         caption = "Source: WHO") +
+    theme_minimal()
+}
+
+# Example: Generate a map for TB incidence in 2020
+plot_tb_map(2020)
+
+
+```
+
+```{r shiny, echo=FALSE}
+# --- SHINY DASHBOARD CODE ---
+# UI Definition
+ui <- dashboardPage(
+  dashboardHeader(title = "Global TB Incidence"),
+  dashboardSidebar(
+    sidebarMenu(
+      menuItem("Dashboard", tabName = "dashboard", icon = icon("globe")),
+      menuItem("Data Table", tabName = "data", icon = icon("table")),
+      menuItem("About", tabName = "about", icon = icon("info-circle"))
+    )
+  ),
+  dashboardBody(
+    tabItems(
+      # Dashboard tab
+      tabItem(tabName = "dashboard",
+        fluidRow(
+          box(title = "Global TB Incidence Map", width = 8, status = "primary",
+              leafletOutput("tb_map", height = "500px")),
+          box(title = "Filters", width = 4, status = "warning",
+              sliderInput("year", "Select Year:", min = 2000, max = 2023, value = 2020, step = 1, animate = TRUE),
+              selectInput("region", "Select Region:", choices = c("All", unique(world$region_un)), selected = "All"),
+              selectInput("income", "Select Income Group:", choices = c("All", unique(world$income_grp)), selected = "All")
+          )
+        ),
+        fluidRow(
+          box(title = "TB Incidence by Gender", width = 6, status = "info", plotlyOutput("gender_plot")),
+          box(title = "TB Incidence by Age Group", width = 6, status = "info", plotlyOutput("age_plot"))
+        )
+      ),
+      # Data Table tab
+      tabItem(tabName = "data",
+        box(title = "TB Data Table", width = 12, DTOutput("tb_table"))
+      ),
+      # About tab
+      tabItem(tabName = "about",
+        box(title = "About", width = 12, p("This dashboard visualizes TB incidence rates globally by region and income level."))
+      )
+    )
+  )
+)
+
+# Server Definition
+server <- function(input, output, session) {
+  
+  # Reactive: Filter TB world data based on user selections
+  filtered_data <- reactive({
+    tb_world_data %>%
+      filter(year == input$year) %>%
+      filter(if (input$region != "All") region_un == input$region else TRUE) %>%
+      filter(if (input$income != "All") income_grp == input$income else TRUE)
+  })
+  
+  # Render Leaflet Map
+  output$tb_map <- renderLeaflet({
+    map_data <- filtered_data()
+    pal <- colorNumeric("YlOrRd", domain = map_data$tb_incidence_per, na.color = "gray90")
+    
+    leaflet(map_data, options = leafletOptions(worldCopyJump = FALSE)) %>%
+      setMaxBounds(lng1 = -180, lat1 = -90, lng2 = 180, lat2 = 90) %>%
+      addTiles() %>%
+      addPolygons(fillColor = ~pal(tb_incidence_per), color = "grey50", weight = 1, fillOpacity = 0.7,
+                  popup = ~paste0("<b>", country_name, "</b><br>",
+                                  "TB Incidence: ", tb_incidence_per, " per 100K<br>",
+                                  "Region: ", region_un, "<br>",
+                                  "Income Group: ", income_grp)) %>%
+      addLegend(pal = pal, values = ~tb_incidence_per, title = "TB Incidence (per 100k)")
+  })
+  
+  # Render Gender Plot (Dropping geometry since it's non-spatial)
+  output$gender_plot <- renderPlotly({
+    gender_data <- filtered_data() %>%
+      st_drop_geometry() %>%
+      mutate(female_cases = tb_incidence_per * 0.45,
+             male_cases   = tb_incidence_per * 0.55) %>%
+      group_by(region_wb) %>%
+      summarise(Female = sum(female_cases, na.rm = TRUE),
+                Male   = sum(male_cases, na.rm = TRUE)) %>%
+      pivot_longer(cols = c(Female, Male), names_to = "Gender", values_to = "Cases") %>%
+      rename(Region = region_wb)
+    
+    p <- ggplot(gender_data, aes(x = Region, y = Cases, fill = Gender,
+                                 text = paste("Region:", Region, "<br>",
+                                              "Cases:", Cases, "<br>",
+                                              "Gender:", Gender))) +
+      geom_bar(stat = "identity", position = "dodge") +
+      theme_minimal() +
+      labs(title = "TB Incidence by Gender (Estimated)",
+           x = "Region", y = "Cases per 100k") +
+      coord_flip()
+    
+    ggplotly(p, tooltip = "text")
+  })
+  
+  # Render Age Plot (Dummy Data for illustration)
+  output$age_plot <- renderPlotly({
+    age_data <- data.frame(
+      Age_Group = seq(0, 80, by = 5),
+      Cases = c(10, 20, 30, 50, 80, 120, 160, 200, 220, 240, 250, 260, 270, 280, 290, 300, 310)
+    )
+    
+    age_data <- age_data %>%
+      mutate(Age_Label = ifelse(Age_Group == 80, "Age group: 80+",
+                                paste("Age group:", Age_Group, "-", Age_Group + 4)))
+    
+    p <- ggplot(age_data, aes(x = Age_Group, y = Cases,
+                              text = paste(Age_Label, "<br>",
+                                           "Cases:", Cases))) +
+      geom_bar(stat = "identity", fill = "darkred") +
+      theme_minimal() +
+      labs(title = "TB Incidence by Age Group (Estimated)",
+           x = "Age", y = "Cases per 100k")
+    
+    ggplotly(p, tooltip = "text")
+  })
+  
+output$tb_table <- renderDT({
+  final_table_data <- filtered_data() %>%
+    st_drop_geometry() %>%          # Remove sf geometry column
+    as_tibble() %>%                 # Convert to tibble so dplyr methods work
+    dplyr::select(
+      iso_a3,
+      name,
+      region_un,
+      region_wb,
+      income_grp,
+      country_name,
+      year,
+      tb_incidence_per,
+      indicator_name
+    ) %>%
+    dplyr::rename(
+      `ISO Code`                = iso_a3,
+      `Map Name`                = name,
+      `UN Region`               = region_un,
+      `World Bank Region`       = region_wb,
+      `Income Group`            = income_grp,
+      `TB Country Name`         = country_name,
+      `Year`                    = year,
+      `TB Incidence (per 100k)` = tb_incidence_per,
+      `Indicator`               = indicator_name
+    )
+  
+  datatable(final_table_data, options = list(scrollX = TRUE))
+})
+}
+
+# Run the Shiny App
+shinyApp(ui, server)
+
+```
