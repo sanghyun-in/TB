@@ -1,0 +1,262 @@
+---
+title: "TB Incidence Analysis & Projection Portfolio"
+author: "Sanghyun In"
+date: "2025-02-26"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: united
+    highlight: tango
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Load necessary libraries
+library(tidyverse)
+library(readxl)
+library(here)
+library(sf)
+library(shiny)
+library(leaflet)
+library(DT)
+library(shinydashboard)
+library(plotly)
+library(rsconnect)
+
+# Load TB incidence data and WHO country profile
+tb_data <- read_csv(here("TB/API_SH.TBS.INCD_DS2_en_csv_v2_76088.csv"), skip = 4)
+all_profile_data <- read_csv(here("TB/Metadata_Country_API_SH.TBS.INCD_DS2_en_csv_v2_76088.csv"))
+
+# Prepare country profile
+country_data <- all_profile_data %>%
+  filter(!is.na(Region)) %>%
+  select(`Country Code`, Region, IncomeGroup) %>%
+  rename(country_code = `Country Code`)
+
+# Pivot TB data and filter years ≥2000
+tb_data <- tb_data %>%
+  rename(country_name = `Country Name`, 
+         country_code = `Country Code`, 
+         indicator_name = `Indicator Name`, 
+         indicator_code = `Indicator Code`) %>%
+  select(-...69) %>%
+  pivot_longer(cols = 5:68, names_to = "year", values_to = "tb_incidence_per") %>%
+  mutate(across(c(year, tb_incidence_per), as.integer)) %>%
+  filter(year >= 2000)
+
+# Merge TB data with country profile
+tb_country_data <- tb_data %>%
+  left_join(country_data, by = "country_code") %>%
+  filter(!is.na(tb_incidence_per))
+
+# Load GDP per capita projections (IMF data)
+proj_data <- read_xls(here("TB/imf-dm-export.xls")) %>%
+  rename(country_name = `GDP, current prices (Billions of U.S. dollars)`)
+
+```
+
+
+```{r analysis}
+# Define income groups
+income_levels <- c("Low income", "Lower middle income", "Upper middle income", "High income")
+
+# Spearman correlation analysis
+tb_income_overall <- tb_country_data %>%
+  filter(IncomeGroup %in% income_levels) %>%
+  mutate(IncomeGroup = factor(IncomeGroup, levels = income_levels, ordered = TRUE)) %>%
+  group_by(IncomeGroup) %>%
+  summarise(mean_tb_incidence = mean(tb_incidence_per, na.rm = TRUE), .groups = "drop")
+
+correlation_result <- cor.test(
+  x = as.numeric(tb_income_overall$IncomeGroup),
+  y = tb_income_overall$mean_tb_incidence,
+  method = "spearman"
+)
+
+ggplot(tb_income_overall, aes(x = IncomeGroup, y = mean_tb_incidence)) +
+  geom_point(aes(color = IncomeGroup), size = 4, alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  theme_minimal() +
+  labs(
+    title = "TB Incidence vs. Income Group",
+    x = "Income Group",
+    y = "Mean TB Incidence per 100,000",
+    caption = paste("Spearman Corr:", round(correlation_result$estimate, 2))
+  ) +
+  theme(legend.position = "none")
+```
+
+
+```{r test}
+# Kruskal-Wallis test & boxplot
+tb_income_data <- tb_country_data %>%
+  filter(IncomeGroup %in% income_levels)
+kruskal_result <- kruskal.test(tb_incidence_per ~ IncomeGroup, data = tb_income_data)
+
+ggplot(tb_income_data, aes(x = factor(IncomeGroup, levels = income_levels), y = tb_incidence_per, fill = IncomeGroup)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "TB Incidence Distribution by Income Group",
+    x = "Income Group",
+    y = "TB Incidence per 100,000"
+  ) +
+  theme(legend.position = "none")
+
+# Linear regression analysis by income group (jitter + smooth)
+tb_income_data <- tb_income_data %>%
+  mutate(IncomeGroupNum = as.numeric(factor(IncomeGroup, levels = income_levels, ordered = TRUE)))
+lm_model <- lm(tb_incidence_per ~ IncomeGroupNum, data = tb_income_data)
+summary(lm_model)
+
+ggplot(tb_income_data, aes(x = IncomeGroupNum, y = tb_incidence_per)) +
+  geom_jitter(width = 0.2, alpha = 0.6, aes(color = IncomeGroup)) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  scale_x_continuous(breaks = 1:4, labels = income_levels) +
+  theme_minimal() +
+  labs(
+    title = "Linear Regression: TB Incidence by Income Group",
+    x = "Income Group",
+    y = "TB Incidence per 100,000"
+  )
+```
+
+
+```{r slope}
+# ============================
+# 1. Compute Effective Slopes by Income Group
+# ============================
+# Compute effective slopes using an interaction model
+model_interaction <- lm(tb_incidence_per ~ year * IncomeGroup, data = tb_country_data %>% filter(IncomeGroup %in% income_levels))
+pred_data <- expand_grid(IncomeGroup = income_levels, year = c(2023, 2024)) %>%
+  mutate(predicted = predict(model_interaction, newdata = .))
+effective_slopes <- pred_data %>%
+  group_by(IncomeGroup) %>%
+  summarise(effective_slope = diff(predicted)) %>%
+  ungroup()
+print(effective_slopes)
+
+```
+
+``` {r projection}
+# ============================
+# 2. GDP Projections and Income Mapping for a Selected Country
+# ============================
+# For projection, we use a selected country (e.g., Colombia) from proj_data.
+selected_country_name <- "Colombia"  # Adjust this based on the actual names in proj_data
+
+# Filter proj_data for the selected country (case-insensitive)
+proj_country <- proj_data %>%
+  filter(tolower(country_name) == tolower(selected_country_name))
+
+# Check if data was found; if not, simulate GDP values.
+if(nrow(proj_country) == 0) {
+  message("No GDP projection data found for ", selected_country_name, ". Using simulated values.")
+  # Simulated GDP per capita values (in USD) for years 2024-2028
+  gdp_values <- c(1500, 1600, 1750, 1900, 2100)
+} else {
+  gdp_values <- proj_country %>%
+    select(`2024`, `2025`, `2026`, `2027`, `2028`) %>%
+    unlist() %>%
+    as.numeric()
+}
+
+# Create a tibble for GDP projections
+gdp_proj <- tibble(
+  year = 2024:2028,
+  GDP = gdp_values
+)
+
+# Define a helper function to assign income group based on GDP per capita thresholds.
+project_income_group <- function(gdp) {
+  if(gdp < 1045) {
+    "Low income"
+  } else if(gdp < 4095) {
+    "Lower middle income"
+  } else if(gdp < 12695) {
+    "Upper middle income"
+  } else {
+    "High income"
+  }
+}
+
+# Map each projection year to an income group and join in the effective slope
+gdp_proj <- gdp_proj %>%
+  mutate(IncomeGroup = map_chr(GDP, project_income_group)) %>%
+  left_join(effective_slopes, by = "IncomeGroup") %>%
+  arrange(year)
+print(gdp_proj)
+
+```
+
+
+```{r TB projection}
+# ============================
+# 3. Segmented Projection of TB Incidence
+# ============================
+# Determine baseline TB incidence (year 2023) for selected country
+selected_country_code <- "VNM"  # Must match tb_country_data$country_code
+baseline <- tb_country_data %>%
+  filter(toupper(country_code) == selected_country_code, year == 2023) %>%
+  summarise(base = mean(tb_incidence_per, na.rm = TRUE)) %>%
+  pull(base)
+print(paste("Baseline (2023) TB Incidence:", baseline))
+
+# Segment the projection period if income group changes
+gdp_proj <- gdp_proj %>%
+  arrange(year) %>%
+  mutate(segment = cumsum(IncomeGroup != lag(IncomeGroup, default = first(IncomeGroup))))
+
+projection_results <- tibble()
+current_baseline_year <- 2023
+current_baseline_incidence <- baseline
+
+for(seg in unique(gdp_proj$segment)){
+  seg_data <- gdp_proj %>% filter(segment == seg)
+  seg_data <- seg_data %>%
+    mutate(predicted_tb_incidence = current_baseline_incidence + effective_slope * (year - current_baseline_year))
+  current_baseline_year <- max(seg_data$year)
+  current_baseline_incidence <- seg_data %>% filter(year == current_baseline_year) %>% pull(predicted_tb_incidence)
+  
+  projection_results <- bind_rows(projection_results, seg_data)
+}
+projection_results <- projection_results %>% arrange(year)
+print(projection_results)
+
+```
+
+
+``` {r historical data}
+# ============================
+# 4. Combine Historical and Projected Data and Plot
+# ============================
+historical_tb <- tb_country_data %>%
+  filter(toupper(country_code) == selected_country_code, year >= 2000, year <= 2023) %>%
+  group_by(year) %>%
+  summarise(real_tb_incidence = mean(tb_incidence_per, na.rm = TRUE)) %>%
+  mutate(DataType = "Historical")
+projected_tb <- projection_results %>%
+  select(year, predicted_tb_incidence) %>%
+  rename(real_tb_incidence = predicted_tb_incidence) %>%
+  mutate(DataType = "Projected")
+combined_data <- bind_rows(historical_tb, projected_tb) %>% arrange(year)
+
+ggplot(combined_data, aes(x = year, y = real_tb_incidence, linetype = DataType)) +
+  geom_line(size = 1, color = "navy") +
+  geom_point(aes(shape = DataType), size = 2, color = "navy") +
+  scale_linetype_manual(values = c("Historical" = "solid", "Projected" = "dotted")) +
+  scale_shape_manual(values = c("Historical" = 16, "Projected" = 16)) +
+  theme_minimal() +
+  labs(
+    title = paste("TB Incidence Projection for", selected_country_name),
+    x = "Year",
+    y = "TB Incidence per 100,000",
+    linetype = "Data Type",
+    shape = "Data Type"
+  )
+
+```
+
